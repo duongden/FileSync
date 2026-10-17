@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.signaling import router as signaling_router
+from api.signaling import router as signaling_router, registry_stats
 
 # SECRET_KEY signs both the TURN HMAC credentials and the JWT. The env var wins
 # (docker run, CI, dev); the compose files instead set SECRET_FILE, pointing at the
@@ -54,10 +54,10 @@ if _cors_origins:
 async def root():
     return {"message": "Welcome to FileSync API!", "version": app.version}
 
-# Add health check route
+# Add health check route reporting liveness + signaling capacity.
 @app.get("/health")
 async def health_check():
-    return {"message": "FileSync API is running!"}
+    return {"message": "FileSync API is running!", **registry_stats()}
 
 # Add uuid route
 @app.get("/uuid")

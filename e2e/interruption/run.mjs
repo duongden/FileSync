@@ -587,6 +587,15 @@ function printVerdict() {
   if (R.downloadCheck && R.downloadCheck.members) {
     console.log(`zip members:         ${R.downloadCheck.members.map((m) => `${m.name}=${m.result}`).join('  ')}`);
   }
+  // Invariant: a "click download" row must show the control (the only resume route).
+  const resumableRow = [...R.samples].reverse().find(
+    (x) => x.r?.ui?.rowError?.shown && /Click download/i.test(x.r.ui.rowError.text || ''),
+  );
+  if (resumableRow) {
+    const btn = resumableRow.r.ui.downloadBtn;
+    const visible = btn === 'block' || btn === 'inline-block';
+    console.log(`resume affordance:   ${visible ? `OK (download visible: ${btn})` : `FAIL (download hidden: ${btn})`}`);
+  }
   console.log('================================================\n');
 }
 

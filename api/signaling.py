@@ -34,8 +34,13 @@ _MAX_MSG_PER_SECOND = 100                # per-connection rate limit (all messag
 _PAIR_WINDOW_SECONDS = 10.0              # sliding-window length for per-target rate limit
 _PAIR_MAX_PER_WINDOW = 50                # max signal msgs from one source to one target per window
 _REGISTER_TIMEOUT_SECONDS = 10.0         # first message must arrive within this window
-_IDLE_TIMEOUT_SECONDS = 30.0             # close if no message at all (clients ping every 10s)
+# Coarse backstop; real liveness is uvicorn's WS ping/pong (see the Dockerfile CMD).
+_IDLE_TIMEOUT_SECONDS = 300.0            # 5 min: tolerate 1-wake/min hidden-tab throttling
 _MAX_CONNECTIONS = int(os.getenv("FILESYNC_MAX_WS", "10000"))
+
+# Host-header cache for ICE relay rewriting; bounded (attacker-controlled key).
+_HOST_CACHE_MAX = 1024
+_HOST_CACHE_TTL_SECONDS = 600.0
 
 # Custom WebSocket close codes (1000-2999 reserved by RFC; 4000-4999 free for app use)
 _CLOSE_INVALID_REGISTER = 4400
@@ -51,7 +56,22 @@ class _PeerRegistry:
 
     def __init__(self) -> None:
         self._peers: Dict[str, WebSocket] = {}
+        # Every accepted socket, registered or not.
+        self._connections = 0
         self._lock = asyncio.Lock()
+
+    async def acquire(self) -> bool:
+        """Reserve a connection slot. Returns False when at capacity."""
+        async with self._lock:
+            if self._connections >= _MAX_CONNECTIONS:
+                return False
+            self._connections += 1
+            return True
+
+    async def release(self) -> None:
+        async with self._lock:
+            if self._connections > 0:
+                self._connections -= 1
 
     async def register(self, peer_id: str, ws: WebSocket) -> Optional[WebSocket]:
         """Atomically claim a peer id. The new ws always wins — if an entry already
@@ -62,8 +82,8 @@ class _PeerRegistry:
         case for "id already taken" is a stale connection from the same client whose TCP
         close hasn't been detected by the server yet — typically after a mobile network
         switch or a brief blip. Without takeover, the client would have to wait for the
-        idle timeout to expire (30 s) before they could reconnect. With takeover, the
-        reconnect is immediate.
+        idle timeout to expire (up to _IDLE_TIMEOUT_SECONDS) before they could
+        reconnect. With takeover, the reconnect is immediate.
 
         Security note: a peer who knows another peer's id (i.e., is already in the same
         room) can kick them off the signaling socket by registering with that id. The
@@ -88,8 +108,20 @@ class _PeerRegistry:
     def size(self) -> int:
         return len(self._peers)
 
+    def connections(self) -> int:
+        return self._connections
+
 
 _REGISTRY = _PeerRegistry()
+
+
+def registry_stats() -> Dict[str, int]:
+    """Snapshot of signaling capacity, surfaced by the /health endpoint."""
+    return {
+        "registered_peers": _REGISTRY.size(),
+        "connections": _REGISTRY.connections(),
+        "max_connections": _MAX_CONNECTIONS,
+    }
 
 
 def _is_valid_peer_id(value) -> bool:
@@ -190,28 +222,36 @@ def _client_host_hint(ws: WebSocket) -> Optional[str]:
     return host or None
 
 
-# Resolution cache for client host headers (hostname -> IPv4). Single-worker event
-# loop, few relay candidates per connection: a plain dict is enough.
-_host_resolutions: Dict[str, Optional[str]] = {}
+# Hostname -> (monotonic timestamp, IPv4); age- and size-bounded (attacker-controlled key).
+_host_resolutions: Dict[str, tuple] = {}
 
 
-def _resolve_host(host: str) -> Optional[str]:
-    """Resolve a hostname to an IPv4 literal for ICE candidate rewriting. Returns None
-    when the host is already an IP literal or cannot be resolved."""
-    if host in _host_resolutions:
-        return _host_resolutions[host]
+async def _resolve_host(host: str) -> Optional[str]:
+    """Resolve a hostname to an IPv4 literal; uses loop.getaddrinfo (never blocks)."""
+    now = time.monotonic()
+    cached = _host_resolutions.get(host)
+    if cached is not None and now - cached[0] < _HOST_CACHE_TTL_SECONDS:
+        return cached[1]
     result: Optional[str] = None
     try:
-        infos = socket.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_DGRAM)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, None, family=socket.AF_INET, type=socket.SOCK_DGRAM
+        )
         if infos:
             result = infos[0][4][0]
     except OSError:
         result = None
-    _host_resolutions[host] = result
+    if len(_host_resolutions) >= _HOST_CACHE_MAX:
+        cutoff = now - _HOST_CACHE_TTL_SECONDS
+        for key in [k for k, (ts, _) in _host_resolutions.items() if ts < cutoff]:
+            del _host_resolutions[key]
+        if len(_host_resolutions) >= _HOST_CACHE_MAX:
+            _host_resolutions.clear()
+    _host_resolutions[host] = (now, result)
     return result
 
 
-def _candidate_target_address(ws: WebSocket) -> Optional[str]:
+async def _candidate_target_address(ws: WebSocket) -> Optional[str]:
     """The relay address the target client can route to: the IP it used to reach this
     server. Chrome rejects ICE candidates whose connection-address is a hostname, so
     the Host header must be resolved to a literal before substitution."""
@@ -222,7 +262,7 @@ def _candidate_target_address(ws: WebSocket) -> Optional[str]:
         ipaddress.ip_address(host)
         return host  # already an IP literal
     except ValueError:
-        return _resolve_host(host)
+        return await _resolve_host(host)
 
 
 def _rewrite_candidate_line(line: str, new_addr: str) -> str:
@@ -238,7 +278,7 @@ def _rewrite_candidate_line(line: str, new_addr: str) -> str:
     return rebuilt
 
 
-def _maybe_rewrite_signal_payload(payload, target_ws: WebSocket):
+async def _maybe_rewrite_signal_payload(payload, target_ws: WebSocket):
     """If payload is an ICE candidate of type 'relay' with a private/loopback address,
     return a shallow-copied payload with the address rewritten to the host the target
     client used. Otherwise return the original payload unchanged.
@@ -264,7 +304,7 @@ def _maybe_rewrite_signal_payload(payload, target_ws: WebSocket):
     if not _is_private_or_loopback(current_addr):
         return payload  # already a routable address; trust it
 
-    new_host = _candidate_target_address(target_ws)
+    new_host = await _candidate_target_address(target_ws)
     if not new_host or new_host == current_addr:
         return payload
 
@@ -289,12 +329,10 @@ router = APIRouter()
 
 @router.websocket("/ws")
 async def signaling(websocket: WebSocket):
-    # Capacity check before accept — refuse early under overload.
-    if _REGISTRY.size() >= _MAX_CONNECTIONS:
+    # Reserve a slot before accept to refuse early under overload.
+    if not await _REGISTRY.acquire():
         await websocket.close(code=_CLOSE_OVERLOADED, reason="Server at capacity.")
         return
-
-    await websocket.accept()
 
     peer_id: Optional[str] = None
     # Global per-connection rate limit: timestamps of recent messages (any type).
@@ -306,6 +344,8 @@ async def signaling(websocket: WebSocket):
     pair_timestamps: Dict[str, list[float]] = {}
 
     try:
+        await websocket.accept()
+
         # ---- Phase 1: register -----------------------------------------------------------
         raw = await _receive_text_with_timeout(websocket, _REGISTER_TIMEOUT_SECONDS)
         if raw is None:
@@ -407,7 +447,7 @@ async def signaling(websocket: WebSocket):
                 # client can't route to. Rewrite that address (and only that address) to
                 # match the IP the target used to reach us. See the dedicated section
                 # above for the rationale.
-                outbound_payload = _maybe_rewrite_signal_payload(payload, target_ws)
+                outbound_payload = await _maybe_rewrite_signal_payload(payload, target_ws)
                 await _send_json_safe(target_ws, {"type": "signal", "from": peer_id, "payload": outbound_payload})
             elif mtype == "ping":
                 await _send_json_safe(websocket, {"type": "pong"})
@@ -427,3 +467,4 @@ async def signaling(websocket: WebSocket):
     finally:
         if peer_id is not None:
             await _REGISTRY.unregister(peer_id, websocket)
+        await _REGISTRY.release()

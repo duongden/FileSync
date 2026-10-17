@@ -1,5 +1,6 @@
 services:
   filesync:
+    # Built and published by release.yml. Pin a version/digest for production.
     image: poliuscorp/filesync
     container_name: filesync-app
     environment:
@@ -16,8 +17,10 @@ services:
     restart: unless-stopped
 
   coturn:
-    image: coturn/coturn:alpine
+    # Pinned: third-party image sitting directly on the media path.
+    image: coturn/coturn:4.18.0-alpine
     container_name: filesync-coturn
+    # Read the shared secret from /keys, then exec turnserver.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
